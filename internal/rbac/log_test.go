@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
 )
@@ -83,6 +84,214 @@ func TestACLLogConcurrent(t *testing.T) {
 				_ = s.AuthLog()
 			}
 		}()
+	}
+	wg.Wait()
+	entries := s.AuthLog()
+	if len(entries) != DefaultAuthLogCap {
+		t.Fatalf("AuthLog len = %d, want %d", len(entries), DefaultAuthLogCap)
+	}
+	for i, e := range entries {
+		if strings.TrimSpace(e.Username) == "" || e.Reason == "" {
+			t.Fatalf("entry %d has empty fields: %+v", i, e)
+		}
+	}
+}
+
+// TestACLLogDenied verifies a denial records the command and key folded into
+// Reason, the format both ACL LOG wire encodings render verbatim.
+func TestACLLogDenied(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.LogDenied("bob", "10.0.0.5:5512", "SET", "forbidden:key")
+	entries := s.AuthLog()
+	if len(entries) != 1 {
+		t.Fatalf("AuthLog len = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Username != "bob" || e.RemoteAddr != "10.0.0.5:5512" {
+		t.Fatalf("entry = %+v", e)
+	}
+	if want := "NOPERM command=SET key=forbidden:key"; e.Reason != want {
+		t.Fatalf("Reason = %q, want %q", e.Reason, want)
+	}
+	if e.Timestamp.IsZero() {
+		t.Fatal("entry has zero timestamp")
+	}
+}
+
+// TestACLLogDeniedKeyless covers keyless commands (ROLE/ACL have no key scope),
+// which pass an empty key through to the Reason string.
+func TestACLLogDeniedKeyless(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.LogDenied("bob", "10.0.0.5:5512", "ACL", "")
+	entries := s.AuthLog()
+	if len(entries) != 1 {
+		t.Fatalf("AuthLog len = %d, want 1", len(entries))
+	}
+	if want := "NOPERM command=ACL key="; entries[0].Reason != want {
+		t.Fatalf("Reason = %q, want %q", entries[0].Reason, want)
+	}
+}
+
+// TestACLLogMixedAuthAndDenied verifies both event kinds share one buffer and
+// stay in chronological order relative to each other.
+func TestACLLogMixedAuthAndDenied(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.LogAuthFailure("alice", "1.2.3.4:5", "invalid password")
+	s.LogDenied("bob", "1.2.3.4:6", "GET", "k1")
+	s.LogAuthFailure("carol", "1.2.3.4:7", "unknown user")
+	entries := s.AuthLog()
+	if len(entries) != 3 {
+		t.Fatalf("AuthLog len = %d, want 3", len(entries))
+	}
+	wantUsers := []string{"alice", "bob", "carol"}
+	for i, want := range wantUsers {
+		if entries[i].Username != want {
+			t.Fatalf("entry %d username = %q, want %q", i, entries[i].Username, want)
+		}
+	}
+	if entries[0].Reason != "invalid password" {
+		t.Fatalf("entry 0 Reason = %q", entries[0].Reason)
+	}
+	if entries[1].Reason != "NOPERM command=GET key=k1" {
+		t.Fatalf("entry 1 Reason = %q", entries[1].Reason)
+	}
+}
+
+// TestACLLogDeniedDoesNotCountAuthFailure guards the counter split: denials are
+// counted by IncDenied at the call sites, never by LogDenied.
+func TestACLLogDeniedDoesNotCountAuthFailure(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	for i := 0; i < 3; i++ {
+		s.LogDenied("bob", "addr", "SET", "k")
+	}
+	if got := s.AuthFailures(); got != 0 {
+		t.Fatalf("AuthFailures = %d, want 0", got)
+	}
+	if got := s.DeniedCommands(); got != 0 {
+		t.Fatalf("DeniedCommands = %d, want 0 (IncDenied owns the counter)", got)
+	}
+}
+
+// TestACLLogDeniedEviction verifies denials share the buffer's bounded capacity
+// with auth failures rather than getting their own.
+func TestACLLogDeniedEviction(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	total := DefaultAuthLogCap + 7
+	for i := 0; i < total; i++ {
+		s.LogDenied("u"+itoa(i), "addr", "GET", "k")
+	}
+	entries := s.AuthLog()
+	if len(entries) != DefaultAuthLogCap {
+		t.Fatalf("AuthLog len = %d, want %d", len(entries), DefaultAuthLogCap)
+	}
+	if entries[0].Username != "u7" {
+		t.Fatalf("oldest survivor = %q, want u7", entries[0].Username)
+	}
+	if entries[len(entries)-1].Username != "u"+itoa(total-1) {
+		t.Fatalf("newest entry = %q, want u%d", entries[len(entries)-1].Username, total-1)
+	}
+}
+
+// TestSeedAuthLog verifies replayed history is restored verbatim, keeping the
+// timestamps the records carried rather than the time of the restore.
+func TestSeedAuthLog(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	past := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	s.SeedAuthLog([]AuthLogEntry{
+		{Timestamp: past, Username: "alice", RemoteAddr: "10.0.0.1:1", Reason: "invalid password"},
+		{Timestamp: past.Add(time.Minute), Username: "bob", RemoteAddr: "10.0.0.2:2", Reason: "NOPERM command=set key=k"},
+	})
+	entries := s.AuthLog()
+	if len(entries) != 2 {
+		t.Fatalf("AuthLog len = %d, want 2", len(entries))
+	}
+	if !entries[0].Timestamp.Equal(past) {
+		t.Fatalf("entry 0 timestamp = %v, want %v", entries[0].Timestamp, past)
+	}
+	if entries[0].Username != "alice" || entries[1].Username != "bob" {
+		t.Fatalf("entries = %+v, want alice then bob", entries)
+	}
+	if entries[1].Reason != "NOPERM command=set key=k" {
+		t.Fatalf("entry 1 Reason = %q", entries[1].Reason)
+	}
+}
+
+// TestSeedAuthLogEmpty verifies seeding nothing leaves the buffer untouched, the
+// case where no audit history existed to replay.
+func TestSeedAuthLogEmpty(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.SeedAuthLog(nil)
+	if entries := s.AuthLog(); entries != nil {
+		t.Fatalf("AuthLog = %v, want nil", entries)
+	}
+}
+
+// TestSeedAuthLogDoesNotCount verifies restored history does not inflate the
+// counters, which report what this process has seen.
+func TestSeedAuthLogDoesNotCount(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.SeedAuthLog([]AuthLogEntry{
+		{Timestamp: time.Now(), Username: "alice", Reason: "invalid password"},
+	})
+	if got := s.AuthFailures(); got != 0 {
+		t.Fatalf("AuthFailures = %d, want 0", got)
+	}
+}
+
+// TestSeedAuthLogEviction verifies seeded entries obey the buffer's capacity
+// instead of getting an exemption from it.
+func TestSeedAuthLogEviction(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	total := DefaultAuthLogCap + 7
+	seed := make([]AuthLogEntry, 0, total)
+	for i := 0; i < total; i++ {
+		seed = append(seed, AuthLogEntry{Timestamp: time.Now(), Username: "u" + itoa(i), Reason: "invalid password"})
+	}
+	s.SeedAuthLog(seed)
+	entries := s.AuthLog()
+	if len(entries) != DefaultAuthLogCap {
+		t.Fatalf("AuthLog len = %d, want %d", len(entries), DefaultAuthLogCap)
+	}
+	if entries[0].Username != "u7" {
+		t.Fatalf("oldest survivor = %q, want u7", entries[0].Username)
+	}
+}
+
+// TestSeedAuthLogThenLive verifies live events append after restored history
+// rather than replacing it.
+func TestSeedAuthLogThenLive(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.SeedAuthLog([]AuthLogEntry{
+		{Timestamp: time.Now().Add(-time.Hour), Username: "restored", Reason: "invalid password"},
+	})
+	s.LogAuthFailure("live", "10.0.0.9:9", "unknown user")
+	entries := s.AuthLog()
+	if len(entries) != 2 {
+		t.Fatalf("AuthLog len = %d, want 2", len(entries))
+	}
+	if entries[0].Username != "restored" || entries[1].Username != "live" {
+		t.Fatalf("entries = %+v, want restored then live", entries)
+	}
+}
+
+// TestACLLogDeniedConcurrent exercises interleaved denial and auth-failure
+// writes; run with -race to prove appendLocked stays serialized.
+func TestACLLogDeniedConcurrent(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if g%2 == 0 {
+					s.LogDenied("bob", "1.2.3.4:5", "SET", "k")
+				} else {
+					s.LogAuthFailure("alice", "1.2.3.4:5", "invalid password")
+				}
+				_ = s.AuthLog()
+			}
+		}(g)
 	}
 	wg.Wait()
 	entries := s.AuthLog()

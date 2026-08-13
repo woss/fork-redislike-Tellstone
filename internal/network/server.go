@@ -462,18 +462,21 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 		if st.session != nil {
 			user = st.session.Username
 		}
+		cmd := msg.Op.String()
+		keyStr := string(msg.Key)
+		s.policy.LogDenied(user, st.remoteAddr, cmd, keyStr)
 		s.audit.Record(audit.EventACLDeny, "command denied by rbac policy",
 			log.String("user", user),
-			log.String("command", msg.Op.String()),
-			log.String("key", string(msg.Key)),
+			log.String("command", cmd),
+			log.String("key", keyStr),
 			log.String("remote_addr", st.remoteAddr),
 			log.String("protocol", "binary"),
 		)
 		if s.logger.Enabled(log.LevelWarn) {
 			s.logger.Log(log.LevelWarn, "network: command denied by rbac policy",
 				log.String("remote_addr", st.remoteAddr),
-				log.String("command", msg.Op.String()),
-				log.String("key", string(msg.Key)),
+				log.String("command", cmd),
+				log.String("key", keyStr),
 			)
 		}
 		return MsgError, ResponseNotAuthorized, true, false
@@ -558,12 +561,16 @@ func (s *Server) discardFrame(c gnet.Conn, totalPacketLen int) {
 	}
 }
 
-// authFailed logs a rejected AUTH attempt to the audit trail, increments the
-// per-connection fail counter, and marks the connection for closure when the
-// rate limit is exceeded. The store-wide ACL counter and log entry are recorded
-// by the caller via LogAuthFailure, which carries the username and reason.
+// authFailed records a rejected AUTH attempt in the ACL LOG buffer and the
+// audit trail, increments the per-connection fail counter, and marks the
+// connection for closure when the rate limit is exceeded. Both recordings live
+// here rather than at the call sites so a new failure path cannot reach one
+// sink without the other, which would let ACL LOG and the audit trail drift.
 func (s *Server) authFailed(st *connState, username, reason string) []byte {
 	st.authFails++
+	if s.policy != nil {
+		s.policy.LogAuthFailure(username, st.remoteAddr, reason)
+	}
 	s.audit.Record(audit.EventAuthFailure, "authentication failed",
 		log.String("user", username),
 		log.String("remote_addr", st.remoteAddr),
@@ -611,9 +618,6 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 		// A truncated frame is still a rejected AUTH: record it like any other
 		// failure so ACL LOG shows attempted-but-undeliverable credentials. The
 		// username is unknown, so the entry carries an empty name.
-		if s.policy != nil {
-			s.policy.LogAuthFailure("", st.remoteAddr, "malformed request")
-		}
 		return authResult{respPayload: s.authFailed(st, "", "malformed request"), respType: MsgAuthErr}
 	}
 	// A JWT-shaped secret is a bearer token, not a password: route it to the
@@ -637,7 +641,11 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	if s.policy != nil {
 		p := s.policy.Load()
 		if p == nil {
-			return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
+			// Recorded like any other rejection rather than returned bare: this
+			// is still a failed AUTH, so it belongs in ACL LOG and the audit
+			// trail and must count against the per-connection limit. The RESP
+			// listener reports it under the same reason.
+			return authResult{respPayload: s.authFailed(st, string(username), "policy not loaded"), respType: MsgAuthErr}
 		}
 		name = "default"
 		if len(username) > 0 {
@@ -645,9 +653,8 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 		}
 		u := p.UserFor(name)
 		if u == nil {
-			// Unknown usernames fail synchronously; the worker only records
-			// failures for real users, so log the attempt here for ACL LOG.
-			s.policy.LogAuthFailure(name, st.remoteAddr, "unknown user")
+			// Unknown usernames fail synchronously; the worker never sees them,
+			// so the rejection is recorded here on the synchronous path.
 			return authResult{respPayload: s.authFailed(st, name, "unknown user"), respType: MsgAuthErr}
 		}
 		// Empty hash marks a nopass user that accepts any password (Redis
@@ -723,11 +730,6 @@ func (s *Server) authWorker() {
 					)
 				}
 			} else {
-				// Record the store-wide failure counter and ACL LOG entry with
-				// the attempted username before the per-connection handling.
-				if s.policy != nil {
-					s.policy.LogAuthFailure(job.username, st.remoteAddr, job.reason)
-				}
 				respPayload, respType = s.authFailed(st, job.username, job.reason), MsgAuthErr
 			}
 			var writeErr error
