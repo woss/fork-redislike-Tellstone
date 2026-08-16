@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -127,6 +128,16 @@ func replayAuthLog(dir string, engine *crypto.Engine, maxEntries int, logger log
 // readFile decodes one audit file into its replayable entries, oldest first. An
 // unreadable file yields nothing: one damaged file must not cost the history
 // held in its siblings.
+//
+// Three cases:
+//  1. Valid header (ok=true, err=nil): keyMode is the authority.
+//     KeyModeSimple → plaintext; KeyModeEnvelope → sealed records with
+//     fingerprint validation before decryption (fail-closed on mismatch).
+//  2. No magic prefix (ok=false, err=nil): legacy file created before the
+//     header feature. Format inferred from the engine parameter.
+//  3. Magic present but header invalid (ok=false, err≠nil): the file is
+//     recognised as a Tellstone audit segment but is corrupt or from an
+//     unsupported version. It is skipped entirely — no fallback decoding.
 func readFile(path string, engine *crypto.Engine, logger log.Logger) []ReplayEntry {
 	// Audit files are bounded by rotateAfterBytes, and this runs once at startup
 	// off any serving path, so reading a file whole is simpler than streaming it
@@ -141,12 +152,90 @@ func readFile(path string, engine *crypto.Engine, logger log.Logger) []ReplayEnt
 		}
 		return nil
 	}
-	// The same condition newFile applies when deciding to seal records, so the
-	// reader and the writer cannot disagree about the format.
-	if engine != nil && engine.Enabled() {
-		return decodeEncrypted(data, engine, path, logger)
+	keyMode, fingerprint, rest, ok, headerErr := parseHeader(data, logger, path)
+	if headerErr != nil {
+		// Magic present but header is corrupt or unsupported: reject the
+		// entire file. No fallback — the data was written in a format the
+		// reader does not understand.
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "audit: replay skipping file with invalid header",
+				log.String("filename", path),
+				log.String("error", headerErr.Error()),
+			)
+		}
+		return nil
 	}
-	return decodePlaintext(data)
+	if !ok {
+		// No magic — legacy file. Format cannot be determined from the file
+		// itself; infer from the engine parameter.
+		if logger.Enabled(log.LevelDebug) {
+			logger.Log(log.LevelDebug, "audit: replay reading headerless legacy file",
+				log.String("filename", path),
+			)
+		}
+		if engine != nil && engine.Enabled() {
+			return decodeEncrypted(data, engine, path, logger)
+		}
+		return decodePlaintext(data)
+	}
+	// Valid header: keyMode is the authority.
+	switch keyMode {
+	case KeyModeSimple:
+		return decodePlaintext(rest)
+	case KeyModeEnvelope:
+		if engine == nil || !engine.Enabled() {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "audit: replay skipping sealed file with no engine",
+					log.String("filename", path),
+				)
+			}
+			return nil
+		}
+		if engine.KeyFingerprint() != fingerprint {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "audit: replay skipping sealed file: fingerprint mismatch",
+					log.String("filename", path),
+				)
+			}
+			return nil
+		}
+		return decodeEncrypted(rest, engine, path, logger)
+	default:
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "audit: replay skipping file with unknown keyMode",
+				log.String("filename", path),
+				log.Uint("keyMode", uint32(keyMode)),
+			)
+		}
+		return nil
+	}
+}
+
+// parseHeader inspects the first bytes of an audit file for the self-describing
+// header ([magic:4][version:1][keyMode:1][fingerprint:16]).
+//
+// Three outcomes:
+//   - ok=true, err=nil: valid header. Returns keyMode, fingerprint, and rest.
+//   - ok=false, err=nil: no magic prefix — legacy headerless file. Caller may
+//     fall back to engine-based inference.
+//   - ok=false, err≠nil: magic present but version unknown or data truncated.
+//     The file is a recognisable Tellstone audit segment but cannot be decoded.
+//     The caller must reject it without fallback.
+func parseHeader(data []byte, logger log.Logger, path string) (keyMode byte, fingerprint [16]byte, rest []byte, ok bool, err error) {
+	if len(data) < 4 || string(data[:4]) != auditFileMagic {
+		return 0, [16]byte{}, data, false, nil
+	}
+	// Magic present — this is (or was) a headed audit file.
+	if len(data) < auditFileHeaderLen {
+		return 0, [16]byte{}, nil, false, fmt.Errorf("audit: header truncated (%d bytes, need %d)", len(data), auditFileHeaderLen)
+	}
+	version := data[4]
+	if version != auditFileVersion {
+		return 0, [16]byte{}, nil, false, fmt.Errorf("audit: unsupported header version %d", version)
+	}
+	keyMode = data[5]
+	copy(fingerprint[:], data[6:6+16])
+	return keyMode, fingerprint, data[auditFileHeaderLen:], true, nil
 }
 
 // decodePlaintext walks newline-delimited JSON, the format the encoder writes

@@ -108,7 +108,22 @@ func NewLogEngine(
 			return nil, fmt.Errorf("audit: data engine init: %w", err)
 		}
 	}
-	f, err := newFile(auditLogPath, engine, logger)
+	// Compute the file header metadata. The keyMode must match the record
+	// format the reader will encounter:
+	//   - KeyModeSimple  → plaintext JSON lines, no engine needed.
+	//   - KeyModeEnvelope → length-prefixed sealed records, engine required.
+	// The envelope flag only controls which key sealed the records (DEK vs
+	// KEK), not whether they are sealed at all.
+	var keyMode byte
+	var fingerprint [16]byte
+	if engine != nil && engine.Enabled() {
+		keyMode = KeyModeEnvelope
+		fingerprint = engine.KeyFingerprint()
+	} else if len(key) > 0 {
+		keyMode = KeyModeSimple
+		fingerprint = crypto.FingerprintBytes(key)
+	}
+	f, err := newFile(auditLogPath, engine, logger, keyMode, fingerprint)
 	if err != nil {
 		return nil, err
 	}
