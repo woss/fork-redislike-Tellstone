@@ -77,9 +77,20 @@ func initRuntimeSettings(l logger.Logger) {
 }
 
 func main() {
+	// Subcommand dispatch — "audit" is not a server flag, so detect it
+	// before config/flag parsing so "audit -h" and "audit decrypt -h"
+	// route to the CLI tool, not the server.
+	if len(os.Args) > 1 && os.Args[1] == "audit" {
+		runAudit(os.Args[2:])
+		return
+	}
 	for _, arg := range os.Args[1:] {
 		if arg == "-version" || arg == "--version" {
 			version.Print()
+			return
+		}
+		if arg == "-h" || arg == "--help" {
+			config.LoadConfig(os.Args[1:])
 			return
 		}
 	}
