@@ -65,7 +65,10 @@ release:
   prerelease: auto
 
 dockers_v2:
-  - images:
+  - ids:
+      - tellstone
+      - tellstone-nfpm
+    images:
       - "ghcr.io/saxy/tellstone"
     tags:
       - "v{{ .Version }}"

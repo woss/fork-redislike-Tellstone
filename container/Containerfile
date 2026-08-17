@@ -10,7 +10,8 @@ LABEL org.opencontainers.image.description="High-performance, cloud-native in-me
 LABEL org.opencontainers.image.source="https://github.com/Saxy/Tellstone"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-COPY tellstone /tellstone
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/tellstone /tellstone
 
 ENV TSD_ADDR=0.0.0.0:9988
 
