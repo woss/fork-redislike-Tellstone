@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
 	"github.com/Saxy/Tellstone/internal/audit"
 	"github.com/Saxy/Tellstone/internal/command"
@@ -95,6 +96,10 @@ type Server struct {
 	// --enable-audit is not set it is a disabled no-op whose Record() costs a
 	// single bool comparison, so listeners never guard the call.
 	audit *audit.LogEngine
+	// snapshotDone is closed when the background snapshot loop exits. Shutdown
+	// waits on it so that no in-flight Snapshot can race with shard engine
+	// closure. Nil when snapshots are not configured.
+	snapshotDone chan struct{}
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -136,7 +141,11 @@ func (s *Server) Run() error {
 	// that seals it, and before any listener starts so the restored history is
 	// in place by the time a client can read ACL LOG.
 	s.seedAuditReplay()
-	if err = s.initShards(key, cryptoEngine); err != nil {
+	// Create the signal context before initShards so the snapshot loop
+	// can select on ctx.Done for clean shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err = s.initShards(key, cryptoEngine, ctx); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
 	s.netSrv = network.NewServer(
@@ -176,8 +185,6 @@ func (s *Server) Run() error {
 		}()
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
@@ -336,6 +343,15 @@ func (s *Server) shutdown(ctx context.Context) {
 			logger.Log(log.LevelError, "server: tcp server shutdown error", log.String("error", err.Error()))
 		}
 	}
+	// Wait for the snapshot loop to finish so no Storage.Snapshot is
+	// in-flight when we close the shard engines. Use a select so we
+	// don't block forever if the context deadline is reached.
+	if s.snapshotDone != nil {
+		select {
+		case <-s.snapshotDone:
+		case <-ctx.Done():
+		}
+	}
 	for _, sh := range s.shards {
 		if err := sh.Stop(ctx); err != nil {
 			if logger.Enabled(log.LevelError) {
@@ -452,7 +468,7 @@ func (s *Server) seedAuditReplay() {
 	}
 }
 
-func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
+func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine, ctx context.Context) error {
 	cfg := s.app.GetConfig()
 	numShards := cfg.GetNumShards()
 	logger := s.app.GetLogger()
@@ -492,6 +508,12 @@ func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
 			log.Int("num_shards", numShards),
 			log.String("persistence", p),
 		)
+	}
+	// Start the background snapshot manager if persistence is enabled and
+	// snapshots are configured (either interval or bytes threshold).
+	if store != nil && store.Enabled() && (cfg.GetSnapshotInterval() > 0 || cfg.GetSnapshotBytes() > 0) {
+		s.snapshotDone = make(chan struct{})
+		go s.snapshotLoop(ctx, store, cfg, logger)
 	}
 	return nil
 }
@@ -564,6 +586,71 @@ func (s *Server) startRESPServer() {
 			}
 		}
 	}()
+}
+
+// snapshotLoop runs in the background and triggers WAL snapshots based on
+// time interval and WAL size thresholds. It checks every second for
+// size-based triggers and on the configured interval for time-based triggers.
+// Exits when ctx is canceled (shutdown).
+func (s *Server) snapshotLoop(ctx context.Context, store *persistence.Storage, cfg *config.Config, logger log.Logger) {
+	defer close(s.snapshotDone)
+	interval := cfg.GetSnapshotInterval()
+	bytesThreshold := cfg.GetSnapshotBytes()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	// Per-shard tracking so each shard's interval is independent; initialise
+	// to now so the first interval-triggered snapshot occurs only after the
+	// configured duration has elapsed.
+	lastSnapshot := make([]time.Time, len(s.shards))
+	now := time.Now()
+	for i := range lastSnapshot {
+		lastSnapshot[i] = now
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		for i, sh := range s.shards {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			shardID := uint32(sh.ID)
+
+			// Size-based trigger: snapshot when WAL exceeds the threshold.
+			if bytesThreshold > 0 && store.WALSize(shardID) >= int64(bytesThreshold) {
+				if err := store.Snapshot(shardID, sh.Engine); err != nil {
+					if logger.Enabled(log.LevelError) {
+						logger.Log(log.LevelError, "snapshot: size-triggered snapshot failed",
+							log.Uint("shard", shardID), log.String("error", err.Error()))
+					}
+				} else {
+					if logger.Enabled(log.LevelInfo) {
+						logger.Log(log.LevelInfo, "snapshot: size-triggered",
+							log.Uint("shard", shardID), log.Int("shard_index", i))
+					}
+				}
+				continue
+			}
+
+			// Time-based trigger: snapshot at the configured interval.
+			if interval > 0 && time.Since(lastSnapshot[i]) >= interval {
+				if err := store.Snapshot(shardID, sh.Engine); err != nil {
+					if logger.Enabled(log.LevelError) {
+						logger.Log(log.LevelError, "snapshot: interval-triggered snapshot failed",
+							log.Uint("shard", shardID), log.String("error", err.Error()))
+					}
+				} else {
+					lastSnapshot[i] = time.Now()
+				}
+			}
+		}
+	}
 }
 
 // networkHandler is the binary frontend's data handler. GET, SET and DEL run
