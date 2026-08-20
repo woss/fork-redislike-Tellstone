@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/storage"
 )
 
@@ -115,7 +117,7 @@ func TestOpenShardCreatesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatalf("OpenShard(0): %v", err)
 	}
 	path := filepath.Join(dir, "shard_000.db")
@@ -131,7 +133,7 @@ func TestOpenShardMultipleFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := uint32(0); i < 4; i++ {
-		if err := s.OpenShard(i); err != nil {
+		if err := s.OpenShard(i, nil); err != nil {
 			t.Fatalf("OpenShard(%d): %v", i, err)
 		}
 	}
@@ -149,7 +151,7 @@ func TestOpenShardInvalidPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.dir = "/nonexistent/path"
-	if err := s.OpenShard(0); err == nil {
+	if err := s.OpenShard(0, nil); err == nil {
 		t.Fatal("expected error when opening shard with invalid dir")
 	}
 }
@@ -184,7 +186,7 @@ func TestWriteRecordBinaryFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -233,7 +235,7 @@ func TestWriteZeroTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Write(0, "k", []byte("v"), time.Time{}); err != nil {
@@ -247,7 +249,7 @@ func TestWriteMultipleRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	type record struct {
@@ -285,7 +287,7 @@ func TestLoadShardEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	engine := newTestEngine(t)
@@ -303,7 +305,7 @@ func TestLoadShardRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -350,7 +352,7 @@ func TestLoadShardSkipsExpiredKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -400,7 +402,7 @@ func TestLoadShardTwiceAppended(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -437,7 +439,7 @@ func TestLoadShardTTLRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -485,7 +487,7 @@ func TestWriteEmptyKeyAndValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Write(0, "", []byte{}, time.Time{}); err != nil {
@@ -508,7 +510,7 @@ func TestWriteLargeValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	largeVal := make([]byte, 1024*1024) // 1 MiB
@@ -538,14 +540,14 @@ func TestOpenShardReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Write(0, "k1", []byte("v1"), time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	// Reopening appends to existing file
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Write(0, "k2", []byte("v2"), time.Time{}); err != nil {
@@ -568,7 +570,7 @@ func TestWriteConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -591,7 +593,7 @@ func TestWriteConcurrent(t *testing.T) {
 	if err := s.CloseShard(0); err != nil {
 		t.Fatalf("close shard: %v", err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatalf("reopen shard: %v", err)
 	}
 	engine := newTestEngine(t)
@@ -623,5 +625,389 @@ func TestGetDefaultDir(t *testing.T) {
 	dir := getDefaultDir()
 	if dir == "" {
 		t.Fatal("getDefaultDir returned empty string")
+	}
+}
+
+// --- Encrypted WAL tests ---
+
+func newCryptoEngine(t *testing.T) *crypto.Engine {
+	t.Helper()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	eng, err := crypto.NewEngine(key, nil)
+	if err != nil {
+		t.Fatalf("crypto.NewEngine: %v", err)
+	}
+	return eng
+}
+
+// TestEncryptedWALRoundTrip writes records to an encrypted WAL, closes the shard,
+// reopens it, and replays to verify all records survive.
+func TestEncryptedWALRoundTrip(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	ce := newCryptoEngine(t)
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+
+	// Write records.
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key_%d", i)
+		val := fmt.Sprintf("val_%d", i)
+		if err := s.Write(0, key, []byte(val), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
+
+	// Verify no plaintext keys or values on disk.
+	data, err := os.ReadFile(filepath.Join(dir, "shard_000.db"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("key_%d", i))
+		val := []byte(fmt.Sprintf("val_%d", i))
+		if bytes.Contains(data, key) {
+			t.Errorf("plaintext key %q found on disk", key)
+		}
+		if bytes.Contains(data, val) {
+			t.Errorf("plaintext value %q found on disk", val)
+		}
+	}
+
+	// Reopen and replay.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("reopen OpenShard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if engine.KeyCount() != 50 {
+		t.Fatalf("expected 50 keys, got %d", engine.KeyCount())
+	}
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key_%d", i)
+		expected := fmt.Sprintf("val_%d", i)
+		val, ok := engine.Get(key)
+		if !ok {
+			t.Errorf("key %q not found", key)
+			continue
+		}
+		if string(val) != expected {
+			t.Errorf("key %q = %q, want %q", key, val, expected)
+		}
+	}
+}
+
+// TestEncryptedWALHeaderWritten verifies that OpenShard with a crypto engine
+// writes the WAL magic header to a new file.
+func TestEncryptedWALHeaderWritten(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	ce := newCryptoEngine(t)
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	s.CloseShard(0)
+
+	// Read first 4 bytes from the WAL file.
+	data, err := os.ReadFile(filepath.Join(dir, "shard_000.db"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) < walMagicLen {
+		t.Fatalf("file too short: %d bytes", len(data))
+	}
+	if string(data[:walMagicLen]) != walMagic {
+		t.Fatalf("WAL header = %q, want %q", string(data[:walMagicLen]), walMagic)
+	}
+}
+
+// TestEncryptedWALRejectsMismatchedCrypto verifies that opening an encrypted
+// WAL without a crypto engine, or a plaintext WAL with a crypto engine, fails.
+func TestEncryptedWALRejectsMismatchedCrypto(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	ce := newCryptoEngine(t)
+
+	// Write header + record.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	if err := s.Write(0, "k", []byte("v"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	s.CloseShard(0)
+
+	// Reopen without crypto — should fail.
+	if err := s.OpenShard(0, nil); err == nil {
+		t.Fatal("expected error opening encrypted WAL without crypto")
+	}
+	s.CloseShard(0)
+
+	// Write a plaintext WAL.
+	if err := s.OpenShard(1, nil); err != nil {
+		t.Fatalf("OpenShard plaintext: %v", err)
+	}
+	if err := s.Write(1, "k", []byte("v"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	s.CloseShard(1)
+
+	// Reopen plaintext WAL with crypto — should fail.
+	if err := s.OpenShard(1, ce); err == nil {
+		t.Fatal("expected error opening plaintext WAL with crypto")
+	}
+}
+
+// TestEncryptedWALNonceCounterRecovery verifies that after closing and reopening
+// an encrypted shard, the nonce counter is recovered from the WAL so nonces
+// never repeat.
+func TestEncryptedWALNonceCounterRecovery(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	ce := newCryptoEngine(t)
+
+	// First session: write 10 records.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := s.Write(0, fmt.Sprintf("k%d", i), []byte("v"), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	s.CloseShard(0)
+
+	// Second session: reopen, write more records.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("reopen OpenShard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+
+	// Check the nonce counter was recovered. After 10 writes, the counter
+	// tracks the max nonce (9) and recovery sets it to max+1 = 10.
+	h := s.getShard(0)
+	if h == nil {
+		t.Fatal("shard not found")
+	}
+	ctr := h.nonceCtr.Load()
+	if ctr != 10 {
+		t.Fatalf("nonce counter = %d, want 10", ctr)
+	}
+
+	// Write more records — these must not reuse nonces.
+	for i := 0; i < 10; i++ {
+		if err := s.Write(0, fmt.Sprintf("k2_%d", i), []byte("v"), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write second session: %v", err)
+		}
+	}
+	s.CloseShard(0)
+
+	// Verify all records survive.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("final OpenShard: %v", err)
+	}
+	engine2 := newTestEngine(t)
+	if err := s.LoadShard(0, engine2); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if engine2.KeyCount() != 20 {
+		t.Fatalf("expected 20 keys, got %d", engine2.KeyCount())
+	}
+}
+
+// TestEncryptedWALCorruptRecordStopsReplay verifies that a corrupted encrypted
+// record is detected and replay stops cleanly (remaining records are dropped).
+func TestEncryptedWALCorruptRecordStopsReplay(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	ce := newCryptoEngine(t)
+
+	// Write 5 records.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := s.Write(0, fmt.Sprintf("k%d", i), []byte("v"), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	s.CloseShard(0)
+
+	// Corrupt the file: flip a byte in the 12-byte nonce of the first encrypted
+	// record (after the 4-byte WAL magic header and 4-byte recLen).
+	path := filepath.Join(dir, "shard_000.db")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// Flip a byte within the nonce (offset walMagicLen+4+2 = 10, which is
+	// nonce byte 2). This invalidates the nonce and causes AEAD decryption
+	// to fail for the first record, stopping replay immediately.
+	if len(data) > walMagicLen+10 {
+		data[walMagicLen+10] ^= 0xFF
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Reopen — should not crash, and no records load since the first
+	// record's nonce is corrupted and AEAD verification fails.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if engine.KeyCount() != 0 {
+		t.Fatalf("expected 0 keys (corruption stops replay), got %d", engine.KeyCount())
+	}
+}
+
+// TestEncryptedWALPlaintextReplayUnchanged verifies that the plaintext WAL path
+// (walVer=0) still works correctly with the refactored replay code.
+func TestEncryptedWALPlaintextReplayUnchanged(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	// Use nil crypto engine (plaintext WAL).
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		if err := s.Write(0, fmt.Sprintf("k%d", i), []byte("v"), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	s.CloseShard(0)
+
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if engine.KeyCount() != 30 {
+		t.Fatalf("expected 30 keys, got %d", engine.KeyCount())
+	}
+}
+
+// TestEncryptedNonceCounterSurvivesTruncateWithoutClose verifies that the nonce
+// counter does not regress when the WAL is truncated to walMagicLen (effectively
+// empty) without calling CloseShard. The sidecar must be persisted before
+// truncation in truncateWALLocked so a crash after truncation still has the
+// correct counter on restart.
+func TestEncryptedNonceCounterSurvivesTruncateWithoutClose(t *testing.T) {
+	dir := newTestDir(t)
+	ce := newCryptoEngine(t)
+
+	// Phase 1: open shard, write 10 records, close (persist sidecar).
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := s.Write(0, fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i)), time.Time{}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
+
+	// Phase 2: reopen, write 5 more records (counter is now 15), then
+	// truncate to walMagicLen (empty WAL) WITHOUT CloseShard.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard phase 2: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard phase 2: %v", err)
+	}
+	for i := 10; i < 15; i++ {
+		if err := s.Write(0, fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i)), time.Time{}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	h := s.getShard(0)
+	if h == nil {
+		t.Fatal("shard not found")
+	}
+	ctrBeforeTruncate := h.nonceCtr.Load()
+	if ctrBeforeTruncate != 15 {
+		t.Fatalf("counter before truncate = %d, want 15", ctrBeforeTruncate)
+	}
+
+	// Truncate WAL to magic-only (empty). Do NOT call CloseShard — simulates
+	// a crash after truncation but before graceful shutdown.
+	if err := s.TruncateWALTo(0, walMagicLen); err != nil {
+		t.Fatalf("TruncateWALTo: %v", err)
+	}
+	s2, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage phase 3: %v", err)
+	}
+	defer s2.CloseShard(0)
+	if err := s2.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard phase 3: %v", err)
+	}
+	engine2 := newTestEngine(t)
+	if err := s2.LoadShard(0, engine2); err != nil {
+		t.Fatalf("LoadShard phase 3: %v", err)
+	}
+
+	h2 := s2.getShard(0)
+	if h2 == nil {
+		t.Fatal("shard not found phase 3")
+	}
+	ctrAfterRestart := h2.nonceCtr.Load()
+	if ctrAfterRestart != 15 {
+		t.Fatalf("counter after restart = %d, want 15 (no regression from truncation)", ctrAfterRestart)
 	}
 }
